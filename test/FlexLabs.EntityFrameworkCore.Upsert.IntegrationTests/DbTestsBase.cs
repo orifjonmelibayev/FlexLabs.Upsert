@@ -19,13 +19,21 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
             _fixture = fixture;
         }
 
-        readonly Country _dbCountry = new()
+        readonly Country _dbCountry = new Country
         {
             Name = "...loading...",
             ISO = "AU",
             Created = new DateTime(1970, 1, 1),
         };
-        readonly PageVisit _dbVisitOld = new()
+        readonly Parent _dbParent = new Parent
+        {
+            ParentName = "Parent",
+            Child = new Child
+            {
+                ChildName = "Child",
+            },
+        };
+        readonly PageVisit _dbVisitOld = new PageVisit
         {
             UserID = 1,
             Date = DateTime.Today.AddDays(-1),
@@ -33,7 +41,7 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
             FirstVisit = new DateTime(1970, 1, 1),
             LastVisit = new DateTime(1970, 1, 1),
         };
-        readonly PageVisit _dbVisit = new()
+        readonly PageVisit _dbVisit = new PageVisit
         {
             UserID = 1,
             Date = DateTime.Today,
@@ -41,30 +49,30 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
             FirstVisit = new DateTime(1970, 1, 1),
             LastVisit = new DateTime(1970, 1, 1),
         };
-        readonly Status _dbStatus = new()
+        readonly Status _dbStatus = new Status
         {
             ID = 1,
             Name = "Created",
             LastChecked = new DateTime(1970, 1, 1),
         };
-        readonly Book _dbBook = new()
+        readonly Book _dbBook = new Book
         {
             Name = "The Fellowship of the Ring",
             Genres = new[] { "Fantasy" },
         };
-        readonly NullableCompositeKey _nullableKey1 = new()
+        readonly NullableCompositeKey _nullableKey1 = new NullableCompositeKey
         {
             ID1 = 1,
             ID2 = 2,
             Value = "First",
         };
-        readonly NullableCompositeKey _nullableKey2 = new()
+        readonly NullableCompositeKey _nullableKey2 = new NullableCompositeKey
         {
             ID1 = 1,
             ID2 = null,
             Value = "Second",
         };
-        readonly DateTime _now = new(DateTime.Now.Year, DateTime.Now.Month, DateTime.Now.Day, DateTime.Now.Hour, DateTime.Now.Minute, DateTime.Now.Second);
+        readonly DateTime _now = new DateTime(DateTime.Now.Year, DateTime.Now.Month, DateTime.Now.Day, DateTime.Now.Hour, DateTime.Now.Minute, DateTime.Now.Second);
         readonly int _increment = 8;
 
         private void ResetDb()
@@ -87,6 +95,7 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
             dbContext.RemoveRange(dbContext.StringKeys);
             dbContext.RemoveRange(dbContext.StringKeysAutoGen);
             dbContext.RemoveRange(dbContext.TestEntities);
+            dbContext.RemoveRange(dbContext.Parents);
 
             dbContext.Add(_dbCountry);
             dbContext.Add(_dbVisitOld);
@@ -95,6 +104,7 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
             dbContext.Add(_dbBook);
             dbContext.Add(_nullableKey1);
             dbContext.Add(_nullableKey2);
+            dbContext.Add(_dbParent);
             dbContext.SaveChanges();
         }
 
@@ -105,6 +115,21 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
 
             dbContext.AddRange(seedValue.Cast<object>());
             dbContext.SaveChanges();
+        }
+
+        private static void AssertEqual(PageVisit expected, PageVisit actual)
+        {
+            actual.UserID.Should().Be(expected.UserID);
+            actual.Date.Should().Be(expected.Date);
+            actual.Visits.Should().Be(expected.Visits);
+            actual.FirstVisit.Should().Be(expected.FirstVisit);
+            actual.LastVisit.Should().Be(expected.LastVisit);
+        }
+
+        private static void AssertEqual(Book expected, Book actual)
+        {
+            actual.Name.Should().Be(expected.Name);
+            actual.Genres.Should().Equal(expected.Genres);
         }
 
         [Fact]
@@ -1109,39 +1134,6 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
         }
 
         [Fact]
-        public void Upsert_JsonData_Update_ComplexObject()
-        {
-            if (_fixture.DbDriver != DbDriver.Postgres)
-                return; // Default values on text columns not supported in MySQL
-
-            var existingJson = new JsonData
-            {
-                Data = JsonConvert.SerializeObject(new { hello = "world" }),
-            };
-
-            ResetDb(existingJson);
-            using (var testContext = new TestDbContext(_fixture.DataContextOptions))
-            {
-                testContext.JsonDatas.OrderBy(c => c.ID).Should().SatisfyRespectively(
-                    j => JToken.DeepEquals(JObject.Parse(existingJson.Data), JObject.Parse(j.Data)).Should().BeTrue());
-            }
-
-            using var dbContext = new TestDbContext(_fixture.DataContextOptions);
-
-            var timestamp = new DateTime(2021, 2, 3, 4, 5, 6, DateTimeKind.Utc);
-            var updatedJson = new JsonData
-            {
-                Child = new ChildObject { Value = "test", Time = timestamp }
-            };
-
-            dbContext.JsonDatas.Upsert(updatedJson)
-                .Run();
-
-            dbContext.JsonDatas.OrderBy(c => c.ID).Should().SatisfyRespectively(
-                j => j.Child.Time.Should().Be(timestamp));
-        }
-
-        [Fact]
         public void Upsert_GuidKey_AutoGenThrows()
         {
             ResetDb();
@@ -1634,79 +1626,6 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
         }
 
         [Fact]
-        public void Upsert_UpdateCondition_ValueCheck()
-        {
-            var dbItem1 = new TestEntity
-            {
-                Num1 = 1,
-                Num2 = 2,
-                Text1 = "hello",
-            };
-            var dbItem2 = new TestEntity
-            {
-                Num1 = 2,
-                Num2 = 3,
-                Text1 = null
-            };
-
-            ResetDb(dbItem1, dbItem2);
-            using var dbContext = new TestDbContext(_fixture.DataContextOptions);
-
-            dbContext.TestEntities.UpsertRange(dbItem1, dbItem2)
-                .On(j => j.Num1)
-                .WhenMatched((j, i) => new TestEntity
-                {
-                    Num2 = j.Num2 + 1,
-                })
-                .UpdateIf(j => j.Text1 == "hello")
-                .Run();
-
-            dbContext.TestEntities.OrderBy(t => t.ID).Should().SatisfyRespectively(
-                test => test.Should().MatchModel(dbItem1, num2: dbItem1.Num2 + 1),
-                test => test.Should().MatchModel(dbItem2));
-        }
-
-        [Fact]
-        public void Upsert_UpdateCondition_ValueCheck_UpdateColumnFromCondition()
-        {
-            if (BuildEnvironment.IsGitHub && _fixture.DbDriver == DbDriver.MySQL && Environment.OSVersion.Platform == PlatformID.Unix)
-            {
-                // Disabling this test on GitHub Ubuntu images - they're cursed?
-                return;
-            }
-
-            var dbItem1 = new TestEntity
-            {
-                Num1 = 1,
-                Num2 = 2,
-                Text1 = "hello",
-            };
-            var dbItem2 = new TestEntity
-            {
-                Num1 = 2,
-                Num2 = 3,
-                Text1 = null
-            };
-
-            ResetDb(dbItem1, dbItem2);
-            using var dbContext = new TestDbContext(_fixture.DataContextOptions);
-
-            dbContext.TestEntities.UpsertRange(dbItem1, dbItem2)
-                .On(j => j.Num1)
-                .WhenMatched((j, i) => new TestEntity
-                {
-                    Num2 = j.Num2 + 1,
-                    Text1 = "world",
-                })
-                .UpdateIf(j => j.Text1 == "hello")
-                .Run();
-
-            dbContext.TestEntities.OrderBy(t => t.ID).Should().SatisfyRespectively(
-                test => test.Should().MatchModel(dbItem1, num2: dbItem1.Num2 + 1, text1: "world"),
-                test => test.Should().MatchModel(dbItem2));
-        }
-
-        [Fact]
         public void Upsert_NullableRequired_Insert()
         {
             if (_fixture.DbDriver == DbDriver.MySQL)
@@ -1745,6 +1664,105 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Tests.EF
                 .Run();
 
             dbContext.NullableRequireds.Should().HaveCount(100_000);
+        }
+
+        [Fact]
+        public virtual void Upsert_Owned_Entity()
+        {
+            ResetDb();
+            using var dbContext = new TestDbContext(_fixture.DataContextOptions);
+
+            var newParent = new Parent
+            {
+                ParentName = "Parent",
+                Child = new Child
+                {
+                    ChildName = "Someone else",
+                },
+                Counter = 3,
+            };
+
+            dbContext.Parents.Upsert(newParent)
+                .On(p => p.ParentName)
+                .Run();
+
+            Assert.Collection(dbContext.Parents.OrderBy(p => p.ParentName),
+                parent =>
+                {
+                    Assert.Equal(newParent.ParentName, parent.ParentName);
+                    Assert.Equal(newParent.Child.ChildName, parent.Child.ChildName);
+                    Assert.Equal(newParent.Counter, parent.Counter);
+                    Assert.Equal(3, parent.Counter);
+                });
+        }
+
+        [Fact]
+        public virtual void Upsert_Owned_Entity_WhenMatched()
+        {
+            ResetDb();
+            using var dbContext = new TestDbContext(_fixture.DataContextOptions);
+
+            var newParent = new Parent
+            {
+                ParentName = "Parent",
+                Child = new Child
+                {
+                    ChildName = "Someone else",
+                },
+            };
+
+            dbContext.Parents.Upsert(newParent)
+                .On(p => p.ParentName)
+                .WhenMatched(p => new Parent
+                {
+                    Counter = p.Counter + 1,
+                    Child = new Child
+                    {
+                        ChildName = "Not me",
+                    },
+                })
+                .Run();
+
+            Assert.Collection(dbContext.Parents.OrderBy(p => p.ParentName),
+                parent =>
+                {
+                    Assert.Equal(newParent.ParentName, parent.ParentName);
+                    Assert.NotEqual(newParent.Child.ChildName, parent.Child.ChildName);
+                    Assert.NotEqual(newParent.Counter, parent.Counter);
+                    Assert.Equal(1, parent.Counter);
+                    Assert.Equal("Not me", parent.Child.ChildName);
+                });
+        }
+
+        [Fact]
+        public virtual void Upsert_Owned_Entity_NoUpdate()
+        {
+            ResetDb();
+            using var dbContext = new TestDbContext(_fixture.DataContextOptions);
+
+            var newParent = new Parent
+            {
+                ParentName = "Parent",
+                Child = new Child
+                {
+                    ChildName = "Someone else",
+                },
+                Counter = 3,
+            };
+
+            dbContext.Parents.Upsert(newParent)
+                .On(p => p.ParentName)
+                .NoUpdate()
+                .Run();
+
+            Assert.Collection(dbContext.Parents.OrderBy(p => p.ParentName),
+                parent =>
+                {
+                    Assert.Equal(newParent.ParentName, parent.ParentName);
+                    Assert.NotEqual(newParent.Child.ChildName, parent.Child.ChildName);
+                    Assert.NotEqual(newParent.Counter, parent.Counter);
+                    Assert.Equal(0, parent.Counter);
+                });
         }
     }
 }
