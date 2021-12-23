@@ -11,6 +11,7 @@ using FlexLabs.EntityFrameworkCore.Upsert.Internal;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Metadata.Internal;
 using Microsoft.EntityFrameworkCore.Storage;
 
 namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
@@ -67,13 +68,7 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
         /// </summary>
         /// <param name="entityType">The entity type of the table</param>
         /// <returns>The fully qualified and escaped table reference</returns>
-        protected virtual string GetTableName(IEntityType entityType)
-        {
-            var tableName = entityType.GetTableName()
-                ?? throw new InvalidOperationException(string.Format(CultureInfo.InvariantCulture, Resources.CouldNotGetTableNameForEntityType, entityType?.Name));
-            return GetSchema(entityType) + EscapeName(tableName);
-        }
-
+        protected virtual string GetTableName(IEntityType entityType) => GetSchema(entityType) + EscapeName(entityType.GetTableName());
         /// <summary>
         /// Prefix used to reference source dataset columns
         /// </summary>
@@ -100,9 +95,15 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
             RunnerQueryOptions queryOptions)
         {
             var joinColumns = ProcessMatchExpression(entityType, match, queryOptions);
-            var joinColumnNames = joinColumns.Select(c => (ColumnName: c.GetColumnBaseName(), c.IsColumnNullable())).ToArray();
+            var joinColumnNames = joinColumns.Select(c => (ColumnName: c.GetColumnNameCompat(), c.IsColumnNullable())).ToArray();
+
+            // Find all properties of Owned Entities
+            var propertiesFromNavigation = entityType.GetNavigations()
+                .Where(x => x.ForeignKey.IsOwnership)
+                .SelectMany(x => x.GetTargetTypeCompat().GetProperties().Where(x => !x.IsShadowProperty()));
 
             var properties = entityType.GetProperties()
+                .Union(propertiesFromNavigation) // Merge regular-properties with OwnedEntity properties
                 .Where(p => queryOptions.AllowIdentityMatch || p.ValueGenerated == ValueGenerated.Never || p.GetAfterSaveBehavior() == PropertySaveBehavior.Save)
                 .Where(p => p.PropertyInfo != null)
                 .ToArray();
@@ -118,7 +119,34 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
                 {
                     var property = entityType.FindProperty(binding.Member.Name);
                     if (property == null)
-                        throw new InvalidOperationException("Unknown property " + binding.Member.Name);
+                    {
+                        var navigation = entityType.FindNavigation(binding.Member.Name);
+                        if (navigation != null && navigation.ForeignKey.IsOwnership && binding.Expression is MemberInitExpression navigationUpdater)
+                        {
+                            foreach (MemberAssignment navigationBinding in navigationUpdater.Bindings)
+                            {
+                                var navigationProperty = navigation.GetTargetTypeCompat().FindProperty(navigationBinding.Member.Name);
+                                if (navigationProperty == null)
+                                {
+                                    throw new InvalidOperationException("Unknown navigation-property " + binding.Member.Name);
+                                }
+
+                                // TODO: Support navigation property expressions! (currently only allows direct values)
+                                var navigationValue = navigationBinding.Expression.GetValue<TEntity>(updater, navigation.GetTargetTypeCompat().FindProperty, queryOptions.UseExpressionCompiler);
+                                if (!(navigationValue is IKnownValue knownNavigationVal))
+                                    knownNavigationVal = new ConstantValue(navigationValue, property);
+
+                                updateExpressions.Add((navigationProperty, knownNavigationVal));
+                            }
+
+                            // Skip further statements, continue with next
+                            continue;
+                        }
+                        else
+                        {
+                            throw new InvalidOperationException("Unknown property " + binding.Member.Name);
+                        }
+                    }
 
                     var value = binding.Expression.GetValue<TEntity>(updater, entityType.FindProperty, queryOptions.UseExpressionCompiler);
                     if (value is not IKnownValue knownVal)
@@ -132,7 +160,7 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
                 updateExpressions = new List<(IProperty Property, IKnownValue Value)>();
                 foreach (var property in properties)
                 {
-                    if (joinColumnNames.Any(c => c.ColumnName == property.GetColumnBaseName()))
+                    if (joinColumnNames.Any(c => c.ColumnName == property.GetColumnNameCompat()))
                         continue;
 
                     var propertyAccess = new PropertyValue(property.Name, false, property);
@@ -153,8 +181,18 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
                 .Select(e => properties
                     .Select(p =>
                     {
-                        var columnName = p.GetColumnBaseName();
-                        var rawValue = p.PropertyInfo?.GetValue(e);
+                        var columnName = p.GetColumnNameCompat();
+                        object rawValue;
+                        if (p.DeclaringEntityType == entityType)
+                        {
+                            rawValue = p.PropertyInfo.GetValue(e);
+                        }
+                        else
+                        {
+                            // Sub-entity so an owned-entity
+                            var navigation = entityType.GetNavigations().Single(x => x.ForeignKey.IsOwnership && x.GetTargetTypeCompat().GetProperties().Contains(p));
+                            rawValue = p.PropertyInfo.GetValue(navigation.PropertyInfo.GetValue(e));
+                        }
                         string? defaultSql = null;
                         if (rawValue == null)
                         {
@@ -189,17 +227,15 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
                 if (updateExpressions != null)
                     arguments.AddRange(updateExpressions.SelectMany(e => e.Value.GetConstantValues()));
 
-#pragma warning disable CA1508 // Avoid dead conditional code. Analyzer is drunk - this can clearly be not null!
                 if (updateConditionExpression != null)
                     arguments.AddRange(updateConditionExpression.GetConstantValues().Where(c => c.Value != null));
-#pragma warning restore CA1508 // Avoid dead conditional code
 
                 int i = 0;
                 foreach (var arg in arguments)
                     arg.ArgumentIndex = i++;
 
                 var columnUpdateExpressions = updateExpressions?.Count > 0
-                    ? updateExpressions.Select(x => (x.Property.GetColumnBaseName(), x.Value)).ToArray()
+                    ? updateExpressions.Select(x => (x.Property.GetColumnNameCompat(), x.Value)).ToArray()
                     : null;
                 var sqlCommand = GenerateCommand(GetTableName(entityType), newEntities.Skip(entitiesProcessed - entitiesHere).Take(entitiesHere).ToArray(), joinColumnNames, columnUpdateExpressions, updateConditionExpression);
                 yield return (sqlCommand, arguments);
@@ -217,7 +253,7 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
             switch (value)
             {
                 case PropertyValue prop:
-                    var columnName = prop.Property.GetColumnBaseName();
+                    var columnName = prop.Property.GetColumnNameCompat();
                     if (expandLeftColumn != null && prop.IsLeftParameter)
                         return expandLeftColumn(columnName);
 
@@ -229,7 +265,7 @@ namespace FlexLabs.EntityFrameworkCore.Upsert.Runners
                     return Parameter(constVal.ArgumentIndex);
 
                 case KnownExpression expression:
-                    return $"( {ExpandExpression(expression, expandLeftColumn)} )";
+                    return $"( {ExpandExpression(expression)} )";
 
                 default:
                     throw new InvalidOperationException();
